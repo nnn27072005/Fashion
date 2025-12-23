@@ -1,74 +1,90 @@
 import torch
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
-from tqdm import tqdm
 
 class Evaluator:
     def __init__(self, device):
         self.device = device
-        # Cấu hình tính mAP theo chuẩn COCO
+        # Cấu hình tính mAP theo chuẩn COCO (xyxy: xmin, ymin, xmax, ymax)
         self.map_metric = MeanAveragePrecision(box_format="xyxy", class_metrics=True)
+
+    def box_cxcywh_to_xyxy(self, x):
+        """
+        Hàm hỗ trợ chuyển đổi format box từ (cx, cy, w, h) sang (x1, y1, x2, y2)
+        x: Tensor shape (N, 4)
+        """
+        x_c, y_c, w, h = x.unbind(-1)
+        b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+             (x_c + 0.5 * w), (y_c + 0.5 * h)]
+        return torch.stack(b, dim=-1)
 
     def update(self, outputs, target, target_sizes):
         """
-        outputs: Output từ model (logits, pred_boxes, attr_logits)
-        target: Ground truth từ dataloader
-        target_sizes: Kích thước ảnh gốc (để scale box về đúng pixel)
+        outputs: Output từ model (logits, pred_boxes)
+        target: Ground truth từ dataloader (List of Dicts)
+        target_sizes: Kích thước ảnh gốc (tensor [Batch, 2] -> (h, w))
         """
-        # 1. Xử lý Output của Model (Post-processing)
-        # YOLOS trả về box [0, 1], cần nhân với kích thước ảnh để ra pixel [x, y, w, h]
-        # Tuy nhiên, torchmetrics cần [x_min, y_min, x_max, y_max]
         
+        # --- 1. Xử lý Output của Model (Predictions) ---
         logits = outputs.logits
-        pred_boxes = outputs.pred_boxes
-        attr_logits = outputs.attr_logits # [Batch, Queries, Num_Attributes]
+        pred_boxes = outputs.pred_boxes # Đang là (cx, cy, w, h) NORMALIZED [0-1]
         
         preds = []
         
         for i in range(len(logits)):
-            # Lấy kích thước ảnh gốc
-            h, w = target_sizes[i]
-            scale_fct = torch.tensor([w, h, w, h]).to(self.device)
+            # Lấy kích thước ảnh gốc (h, w)
+            h_img, w_img = target_sizes[i]
             
-            # Lọc bớt các box có confidence thấp để tính cho nhanh
+            # Tạo vector scale (w, h, w, h) để nhân vào box
+            scale_fct = torch.tensor([w_img, h_img, w_img, h_img]).to(self.device)
+            
+            # Softmax & Filter score
             prob = logits[i].softmax(-1)
-            scores, labels = prob[..., :-1].max(-1) # Bỏ class 'background' cuối cùng
+            scores, labels = prob[..., :-1].max(-1)
             
-            # Chỉ lấy những box có điểm > 0.5 (hoặc thấp hơn tùy strategy)
-            keep = scores > 0.1 
+            # Lấy các box có score > 0 (Lấy hết để tính mAP cho chuẩn, hoặc > 0.05 để nhẹ máy)
+            keep = scores > 0.0 
             
-            # Scale box về pixel
-            boxes = pred_boxes[i][keep] * scale_fct
+            # A. Scale từ 0-1 ra Pixel (vẫn là cx, cy, w, h)
+            scaled_boxes = pred_boxes[i][keep] * scale_fct
+            
+            # B. Convert từ (cx, cy, w, h) -> (x1, y1, x2, y2) <-- BƯỚC QUAN TRỌNG ĐÃ THÊM
+            final_boxes = self.box_cxcywh_to_xyxy(scaled_boxes)
             
             preds.append({
-                "boxes": boxes,
+                "boxes": final_boxes,
                 "scores": scores[keep],
-                "labels": labels[keep],
-                "attr_logits": attr_logits[i][keep] # Lưu attribute tương ứng box
+                "labels": labels[keep]
             })
 
-        # 2. Xử lý Target (Ground Truth)
+        # --- 2. Xử lý Target (Ground Truth) ---
         targets_formatted = []
-        for t in target:
+        
+        for i, t in enumerate(target):
+            # Lấy kích thước ảnh tương ứng
+            h_img, w_img = target_sizes[i]
+            scale_fct = torch.tensor([w_img, h_img, w_img, h_img]).to(self.device)
+
+            # Target box từ Dataset cũng đang là (cx, cy, w, h) NORMALIZED
+            tgt_boxes = t["boxes"].to(self.device)
+            
+            # A. Scale ra Pixel
+            tgt_boxes_pixel = tgt_boxes * scale_fct
+            
+            # B. Convert sang (x1, y1, x2, y2)
+            tgt_boxes_xyxy = self.box_cxcywh_to_xyxy(tgt_boxes_pixel)
+
             targets_formatted.append({
-                "boxes": t["boxes"].to(self.device),
-                "labels": t["class_labels"].to(self.device),
-                "attributes": t.get("attribute_labels", None).to(self.device)
+                "boxes": tgt_boxes_xyxy,
+                "labels": t["class_labels"].to(self.device)
             })
 
-        # 3. Cập nhật metric mAP
-        # Lưu ý: torchmetrics tự lo phần matching IoU
+        # --- 3. Cập nhật metric ---
+        # Lúc này cả Preds và Targets đều đã là: Pixel tuyệt đối & Format XYXY
         self.map_metric.update(preds, targets_formatted)
         
-        # 4. Tính Attribute Accuracy (Thủ công)
-        # Logic: Với mỗi box dự đoán đúng (IoU > 0.5), so khớp attribute
-        # Phần này khá phức tạp vì cần matching box. 
-        # Để đơn giản hóa trong training log, ta tính Accuracy dạng multi-label cơ bản
-        # (Sẽ hoàn thiện kỹ hơn ở bước Test)
-        return 0.0 # Placeholder cho attr acc
+        return 0.0
 
     def compute(self):
-        # Trả về dictionary kết quả mAP
         result = self.map_metric.compute()
-        # Reset cho epoch sau
         self.map_metric.reset()
         return result
