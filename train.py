@@ -76,7 +76,6 @@ def train_model():
     )
     
     # Imbalance Handling: Lấy WeightedSampler
-    # Giúp model nhìn thấy các ảnh "hiếm" (nhẫn, đồng hồ) nhiều hơn
     sampler = train_dataset.get_weighted_sampler()
 
     train_loader = DataLoader(
@@ -101,7 +100,7 @@ def train_model():
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg_train['batch_size'],
-        shuffle=False, # Val set không cần shuffle
+        shuffle=False,
         collate_fn=collate_fn,
         num_workers=cfg_sys['num_workers'],
         pin_memory=True if torch.cuda.is_available() else False
@@ -112,7 +111,6 @@ def train_model():
     # ---------------------------------------------------------
     # 4. OPTIMIZER & EVALUATOR
     # ---------------------------------------------------------
-    # Tách LR: Backbone train chậm hơn (1e-5), Head train nhanh hơn (1e-4)
     param_dicts = [
         {
             "params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad],
@@ -191,18 +189,48 @@ def train_model():
         model.eval()
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Evaluating"):
+            for (i,batch) in tqdm(enumerate(val_loader), desc="Evaluating"):
                 pixel_values = batch["pixel_values"].to(device)
                 labels = [{k: v.to(device) for k, v in t.items()} for t in batch["labels"]]
                 
-                # Forward (Không truyền labels để lấy prediction)
+                # 1. Forward
                 outputs = model(pixel_values=pixel_values)
                 
-                # Lấy kích thước tensor hiện tại làm target size tham chiếu
-                target_sizes = [(img.shape[1], img.shape[2]) for img in batch["pixel_values"]]
+                # 2. Chuẩn bị Target Sizes
+                target_sizes = torch.tensor([img.shape[1:] for img in pixel_values]).to(device)
                 
-                # Cập nhật metrics
-                evaluator.update(outputs, labels, target_sizes)
+                # 3. Chuẩn bị Labels (QUAN TRỌNG: Phải tạo mới, không dùng biến cũ nếu nghi ngờ)
+                # Lấy lại raw labels từ batch để chắc chắn nó là List of Dicts
+                raw_labels = batch["labels"]
+                
+                # --- DEBUG CHẶN LỖI (Thêm đoạn này để kiểm tra) ---
+                if not isinstance(raw_labels, list):
+                    print(f"❌ LỖI NGHIÊM TRỌNG: batch['labels'] không phải là List! Nó là: {type(raw_labels)}")
+                    # Thử in nội dung để xem nó là gì
+                    print(raw_labels)
+                    break # Dừng ngay
+                    
+                first_item = raw_labels[0]
+                if not isinstance(first_item, dict):
+                    print(f"❌ LỖI NGHIÊM TRỌNG: Phần tử trong labels không phải Dict! Nó là: {type(first_item)}")
+                    print(f"Nội dung: {first_item}")
+                    break
+                # -----------------------------------------------
+
+                # Chuyển labels sang device thủ công để đảm bảo đúng định dạng
+                clean_labels = []
+                for t in raw_labels:
+                    clean_t = {}
+                    for k, v in t.items():
+                        if isinstance(v, torch.Tensor):
+                            clean_t[k] = v.to(device)
+                        else:
+                            clean_t[k] = v # Giữ nguyên nếu không phải tensor (vd: image_id int)
+                    clean_labels.append(clean_t)
+
+                # 4. Update Evaluator
+                # Lưu ý thứ tự: (outputs, target, target_sizes)
+                evaluator.update(outputs, clean_labels, target_sizes)
 
         # Tính toán kết quả
         metrics = evaluator.compute()
