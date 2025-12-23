@@ -5,44 +5,150 @@ import numpy as np
 from torch.utils.data import Dataset, WeightedRandomSampler
 from pycocotools.coco import COCO
 import albumentations as A
+import random
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class ImageAugmentation:
+    """
+    Augmentation thủ công cho Object Detection (Image + Bounding Boxes).
+    Thay thế cho Albumentations.
+    """
+    def __init__(self, 
+                 target_size=(800, 800),
+                 p_flip=0.5,
+                 brightness=0.2, 
+                 contrast=0.2,
+                 train=True):
+        
+        self.target_size = target_size # (H, W)
+        self.p_flip = p_flip
+        self.brightness = brightness
+        self.contrast = contrast
+        self.train = train
+
+    def __call__(self, image, boxes, category_ids):
+        """
+        Args:
+            image: numpy array (H, W, 3) - RGB
+            boxes: list of [x, y, w, h]
+            category_ids: list of labels
+        Returns:
+            image: augmented image
+            boxes: augmented boxes
+            category_ids: valid labels (sau khi lọc box lỗi)
+        """
+        # Convert boxes to numpy for easier math
+        boxes = np.array(boxes, dtype=np.float32)
+        if len(boxes) == 0:
+            boxes = np.zeros((0, 4), dtype=np.float32)
+
+        if self.train:
+            # 1. Color Jitter (Chỉ đổi màu, không đổi vị trí box)
+            image = self._color_jitter(image)
+
+            # 2. Horizontal Flip (Cần đổi tọa độ box)
+            if random.random() < self.p_flip:
+                image, boxes = self._horizontal_flip(image, boxes)
+
+        # 3. Resize & Pad (Letterbox) - Quan trọng để đưa về size chuẩn (800x800)
+        # Bước này làm cho cả Train và Val
+        image, boxes = self._resize_and_pad(image, boxes)
+
+        return image, boxes, category_ids
+
+    def _color_jitter(self, image):
+        """Thay đổi độ sáng và tương phản"""
+        img = image.astype(np.float32)
+        
+        # Brightness
+        beta = random.uniform(-self.brightness, self.brightness) * 255
+        img = img + beta
+        
+        # Contrast
+        alpha = random.uniform(1.0 - self.contrast, 1.0 + self.contrast)
+        mean = np.mean(img, axis=(0, 1), keepdims=True)
+        img = (img - mean) * alpha + mean
+        
+        # Clip về 0-255
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+
+    def _horizontal_flip(self, image, boxes):
+        """Lật ảnh ngang và tính lại tọa độ box"""
+        h, w = image.shape[:2]
+        
+        # Flip ảnh
+        image = cv2.flip(image, 1) # 1 là horizontal flip
+
+        # Flip boxes: [x, y, w, h]
+        # x_new = width - (x_old + w_old)
+        if len(boxes) > 0:
+            boxes[:, 0] = w - (boxes[:, 0] + boxes[:, 2])
+            
+        return image, boxes
+
+    def _resize_and_pad(self, image, boxes):
+        """
+        Resize giữ tỷ lệ (Letterbox) và thêm viền (Pad) để đạt target_size.
+        Đây là kỹ thuật chuẩn của YOLO/DETR.
+        """
+        target_h, target_w = self.target_size
+        h, w = image.shape[:2]
+        
+        # 1. Tính tỉ lệ scale
+        scale = min(target_w / w, target_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        
+        # 2. Resize ảnh
+        image_resized = cv2.resize(image, (new_w, new_h))
+        
+        # 3. Tạo canvas màu xám (124, 116, 104) để paste ảnh vào giữa
+        canvas = np.full((target_h, target_w, 3), (124, 116, 104), dtype=np.uint8)
+        
+        # Tính offset để đặt ảnh vào giữa
+        pad_x = (target_w - new_w) // 2
+        pad_y = (target_h - new_h) // 2
+        
+        canvas[pad_y:pad_y+new_h, pad_x:pad_x+new_w, :] = image_resized
+        
+        # 4. Transform Boxes
+        if len(boxes) > 0:
+            # Scale
+            boxes[:, :4] *= scale
+            # Shift (Cộng thêm phần padding)
+            boxes[:, 0] += pad_x
+            boxes[:, 1] += pad_y
+            
+        return canvas, boxes
 
 class FashionDataset(Dataset):
     def __init__(self, img_dir, ann_file, feature_extractor, train=False, num_attributes=294):
         self.img_dir = img_dir
         self.coco = COCO(ann_file)
-        self.ids = list(sorted(self.coco.imgs.keys()))
+        # self.ids = list(sorted(self.coco.imgs.keys()))
+        # train with 100 images for quick testing
+        all_ids = list(sorted(self.coco.imgs.keys()))
+        
+        if train:
+            # Lấy 100 ảnh để debug
+            self.ids = all_ids[:100]  
+            print(f"⚠️ DEBUG MODE: Đã cắt ngắn Dataset còn {len(self.ids)} ảnh!", flush=True)
+        else:
+            # Lấy 50 ảnh để val
+            self.ids = all_ids[:50]
+            print(f"ℹ️ VAL MODE: Sử dụng {len(self.ids)} ảnh validation.", flush=True)
         self.feature_extractor = feature_extractor
         self.num_attributes = num_attributes
         self.train = train
-        self.transforms = self.get_transforms(train)
-
-    def get_transforms(self, train=False):
-        if train:
-            return A.Compose([
-                A.OneOf([
-                    # Compose để bọc Pad + Crop an toàn
-                    A.Compose([
-                        # Quay lại dùng 'value' vì phiên bản của bạn báo lỗi với 'pad_cval'
-                        A.PadIfNeeded(min_height=800, min_width=800, border_mode=cv2.BORDER_CONSTANT, value=[124, 116, 104]),
-                        A.RandomCrop(width=800, height=800),
-                    ]),
-                    A.RandomResizedCrop(size=(800, 800), scale=(0.5, 1.0)),
-                ], p=0.5),
-                
-                A.HorizontalFlip(p=0.5),
-                A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.3),
-                A.RandomBrightnessContrast(p=0.2),
-                
-                A.LongestMaxSize(max_size=1333),
-                A.PadIfNeeded(min_height=800, min_width=800, border_mode=cv2.BORDER_CONSTANT, value=[124, 116, 104])
-            ], 
-            bbox_params=A.BboxParams(format='coco', label_fields=['indices'], min_visibility=0.3))
-        else:
-            return A.Compose([
-                A.LongestMaxSize(max_size=1333),
-                A.PadIfNeeded(min_height=800, min_width=800, border_mode=cv2.BORDER_CONSTANT, value=[124, 116, 104])
-            ], 
-            bbox_params=A.BboxParams(format='coco', label_fields=['indices']))
+        self.augmentor = ImageAugmentation(
+            target_size=(800, 800),
+            train=train,
+            p_flip=0.5,
+            brightness=0.2,
+            contrast=0.2
+        )
 
     def __getitem__(self, index):
         coco = self.coco
@@ -85,50 +191,13 @@ class FashionDataset(Dataset):
             attribute_ids_list.append(ann.get('attribute_ids', []))
 
         # 2. Augmentation
-        indices = list(range(len(boxes)))
-
-        if self.transforms:
-            try:
-                transformed = self.transforms(
-                    image=image, 
-                    bboxes=boxes, 
-                    indices=indices 
-                )
-                image = transformed['image']
-                final_boxes_aug = transformed['bboxes']
-                surviving_indices = transformed['indices']
-                
-                final_boxes = []
-                final_categories = []
-                final_attributes_list = []
-                final_area = []
-                final_iscrowd = []
-                
-                for i, original_idx in enumerate(surviving_indices):
-                    idx = int(original_idx) # Fix lỗi float index
-                    final_boxes.append(final_boxes_aug[i])
-                    final_categories.append(category_ids[idx])
-                    final_attributes_list.append(attribute_ids_list[idx])
-                    final_area.append(area[idx])
-                    final_iscrowd.append(iscrowd[idx])
-                    
-            except ValueError as e:
-                print(f"Aug Error {img_path}: {e}")
-                final_boxes = boxes
-                final_categories = category_ids
-                final_attributes_list = attribute_ids_list
-                final_area = area
-                final_iscrowd = iscrowd
-        else:
-            final_boxes = boxes
-            final_categories = category_ids
-            final_attributes_list = attribute_ids_list
-            final_area = area
-            final_iscrowd = iscrowd
+        image, final_boxes, final_categories = self.augmentor(image, boxes, category_ids)
+        final_attributes_list = attribute_ids_list # Augment màu/flip không làm thay đổi thuộc tính
+        final_area = area 
+        final_iscrowd = iscrowd
 
         # 3. Format Output & NORMALIZE (Quan trọng)
         # YOLOS/DETR yêu cầu box dạng: [cx, cy, w, h] đã chuẩn hóa về 0-1
-        # Chúng ta phải tự làm bước này vì không dùng Processor để xử lý annotation nữa
         out_boxes = []
         out_attributes = []
         img_h, img_w, _ = image.shape # Kích thước ảnh sau khi augment
@@ -174,7 +243,6 @@ class FashionDataset(Dataset):
             target["iscrowd"] = torch.zeros((0,), dtype=torch.int64)
 
         # QUAN TRỌNG: Chỉ đưa ảnh vào Processor để chuẩn hóa pixel
-        # KHÔNG đưa annotations vào nữa để tránh lỗi ValueError
         encoding = self.feature_extractor(
             images=image, 
             return_tensors="pt"
