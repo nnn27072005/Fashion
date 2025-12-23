@@ -85,6 +85,35 @@ class Evaluator:
         return 0.0
 
     def compute(self):
+        # 1. Tính toán
         result = self.map_metric.compute()
+        
+        # 2. Reset cho epoch sau
         self.map_metric.reset()
+        
+        # 3. TRÍCH XUẤT CHỈ SỐ QUAN TRỌNG
+        # result là một dict chứa rất nhiều key: map, map_50, map_75, map_small...
+        
+        print("\n" + "="*40)
+        print("📊 CHI TIẾT HIỆU NĂNG (COCO METRICS)")
+        print("="*40)
+        
+        # --- A. Tổng quan ---
+        print(f"⭐ mAP (0.50:0.95): {result['map'].item():.4f}  (Mục tiêu: >0.5)")
+        print(f"   mAP@50          : {result['map_50'].item():.4f}")
+        print(f"   mAP@75          : {result['map_75'].item():.4f}")
+        
+        # --- B. Phân theo kích thước (Quan trọng cho đồ án của bạn) ---
+        print("-" * 20)
+        print(f"🐜 AP_small (Đồ nhỏ): {result['map_small'].item():.4f}")
+        print(f"Medium AP_medium     : {result['map_medium'].item():.4f}")
+        print(f"🐘 AP_large (Đồ to) : {result['map_large'].item():.4f}")
+        
+        # --- C. Recall (Độ nhạy - KPI của bạn) ---
+        print("-" * 20)
+        print(f"📡 Recall_small      : {result['mar_small'].item():.4f} (Mục tiêu: >0.4 - 0.7)")
+        print(f"   Recall_large      : {result['mar_100'].item():.4f}")
+        
+        # --- D. Trả về dict để main log hoặc lưu model ---
+        # Bạn có thể chọn map_small làm tiêu chí lưu model nếu muốn ưu tiên đồ nhỏ
         return result
