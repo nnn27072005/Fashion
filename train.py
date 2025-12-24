@@ -3,284 +3,113 @@ import yaml
 import torch
 import math
 from torch.utils.data import DataLoader
-# from transformers import YolosImageProcessor, YolosConfig
 from transformers import DeformableDetrImageProcessor, DeformableDetrConfig
 from tqdm import tqdm
-import time
-
-# Import các module local đã xây dựng
 from src.dataset import FashionDataset
-# from src.model import FashionYolos
 from src.model import FashionDeformableDETR
 from src.utils import collate_fn
 from src.eval import Evaluator
 
 def train_model():
-    # ---------------------------------------------------------
-    # 1. SETUP & CONFIGURATION
-    # ---------------------------------------------------------
-    # Load cấu hình
-    if not os.path.exists("config/config.yaml"):
-        raise FileNotFoundError("Không tìm thấy file config/config.yaml")
-
-    with open("config/config.yaml", "r") as f:
-        config_dict = yaml.safe_load(f)
+    if not os.path.exists("config/config.yaml"): raise FileNotFoundError("Missing config")
+    with open("config/config.yaml", "r") as f: config_dict = yaml.safe_load(f)
     
-    cfg_train = config_dict['training']
-    cfg_model = config_dict['model']
-    cfg_sys = config_dict['system']
-
-    # Thiết lập thiết bị (GPU/CPU)
+    cfg_train, cfg_model, cfg_sys = config_dict['training'], config_dict['model'], config_dict['system']
     device = torch.device(cfg_sys['device'] if torch.cuda.is_available() else "cpu")
-    print(f"--- F&A MODEL TRAINING STARTED ON {device} ---")
-
-    # Tạo thư mục output
+    print(f"--- TRAINING ON {device} | CLASSES: 46 ---")
     os.makedirs(cfg_train['output_dir'], exist_ok=True)
 
-    # ---------------------------------------------------------
-    # 2. MODEL & PROCESSOR INITIALIZATION
-    # ---------------------------------------------------------
-    print(f"Loading base model: {cfg_model['base_model']}...")
-    
-    # Processor (Dùng để resize/normalize ảnh)
-    # size={"shortest_edge": 512, "longest_edge": 800} là setting chuẩn cho YOLOS Small
-    # processor = YolosImageProcessor.from_pretrained(
-    #     cfg_model['base_model'],
-    #     size={"shortest_edge": 512, "longest_edge": 800} 
-    # )
+    # 1. PROCESSOR
     processor = DeformableDetrImageProcessor.from_pretrained(
         cfg_model['base_model'],
-        size={"shortest_edge": 800, "longest_edge": 1333} # Config chuẩn của Deformable DETR
+        size={"shortest_edge": 800, "longest_edge": 1333} 
     )
-    
-    # Config Model
-    # config = YolosConfig.from_pretrained(cfg_model['base_model'])
-    # config.num_labels = cfg_model['num_classes']
-    # config.num_attributes = cfg_model['num_attributes']
+
+    # 2. DATASETS (HuggingFace)
+    DATASET_NAME = "detection-datasets/fashionpedia"
+    train_dataset = FashionDataset(DATASET_NAME, "train", processor, train=True, num_attributes=cfg_model['num_attributes'])
+    val_dataset = FashionDataset(DATASET_NAME, "val", processor, train=False, num_attributes=cfg_model['num_attributes'])
+
+    # 3. MODEL
+    # 46 Object + 1 Background = 47 Labels
     config = DeformableDetrConfig.from_pretrained(cfg_model['base_model'])
-    config.num_labels = cfg_model['num_classes']
+    config.num_labels = 47 
     config.num_attributes = cfg_model['num_attributes']
-    # Khởi tạo Custom Model (FashionYolos)
-    # model = FashionYolos.from_pretrained(
-    #     cfg_model['base_model'], 
-    #     config=config,
-    #     ignore_mismatched_sizes=True
-    # )
-    model = FashionDeformableDETR.from_pretrained(
-        cfg_model['base_model'], 
-        config=config,
-        ignore_mismatched_sizes=True
-    )
+    
+    model = FashionDeformableDETR.from_pretrained(cfg_model['base_model'], config=config, ignore_mismatched_sizes=True)
     model.to(device)
 
-    # ---------------------------------------------------------
-    # 3. DATASET & DATALOADER SETUP
-    # ---------------------------------------------------------
-    print("Initializing Datasets...")
+    # 4. DATALOADER
+    # Dùng Weighted Sampler vì EDA báo động về Imbalance
+    train_sampler = train_dataset.get_weighted_sampler()
     
-    # --- Train Dataset ---
-    # train=True để kích hoạt Augmentation (Crop, Flip, ColorJitter...)
-    train_dataset = FashionDataset(
-        img_dir=cfg_train['train_img_dir'],
-        ann_file=cfg_train['train_ann'],
-        feature_extractor=processor,
-        train=True, 
-        num_attributes=cfg_model['num_attributes']
-    )
-    
-    # Imbalance Handling: Lấy WeightedSampler
-    sampler = train_dataset.get_weighted_sampler()
-
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg_train['batch_size'],
-        sampler=sampler, # Đã dùng sampler thì KHÔNG dùng shuffle=True
-        collate_fn=collate_fn,
-        num_workers=cfg_sys['num_workers'],
-        pin_memory=True if torch.cuda.is_available() else False
+        train_dataset, batch_size=cfg_train['batch_size'],
+        sampler=train_sampler, shuffle=False, 
+        collate_fn=collate_fn, num_workers=cfg_sys['num_workers']
     )
-
-    # --- Validation Dataset ---
-    # train=False để chỉ Resize ảnh chuẩn, không Augmentation
-    val_dataset = FashionDataset(
-        img_dir=cfg_train['val_img_dir'],
-        ann_file=cfg_train['val_ann'],
-        feature_extractor=processor,
-        train=False,
-        num_attributes=cfg_model['num_attributes']
-    )
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg_train['batch_size'],
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=cfg_sys['num_workers'],
-        pin_memory=True if torch.cuda.is_available() else False
+        val_dataset, batch_size=cfg_train['batch_size'], shuffle=False,
+        collate_fn=collate_fn, num_workers=cfg_sys['num_workers']
     )
 
-    print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
-
-    # ---------------------------------------------------------
-    # 4. OPTIMIZER & EVALUATOR
-    # ---------------------------------------------------------
+    # 5. OPTIMIZER
     param_dicts = [
-        {
-            "params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad],
-            "lr": cfg_train['lr'],
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
-            "lr": cfg_train['lr'] * 0.1, 
-        },
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad], "lr": cfg_train['lr']},
+        {"params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad], "lr": cfg_train['lr'] * 0.1},
     ]
-    
-    optimizer = torch.optim.AdamW(
-        param_dicts, 
-        lr=cfg_train['lr'], 
-        weight_decay=cfg_train['weight_decay']
-    )
-
-    # Công cụ đánh giá (Tính mAP)
+    optimizer = torch.optim.AdamW(param_dicts, lr=cfg_train['lr'], weight_decay=cfg_train['weight_decay'])
     evaluator = Evaluator(device)
-    
-    # Biến lưu trữ
     best_map = 0.0
-    start_time = time.time()
 
-    # ---------------------------------------------------------
-    # 5. TRAINING LOOP
-    # ---------------------------------------------------------
+    # 6. LOOP
     for epoch in range(cfg_train['epochs']):
-        print(f"\n{'='*20} Epoch {epoch + 1}/{cfg_train['epochs']} {'='*20}")
-        # --- TRAINING PHASE ---
+        print(f"\n{'='*10} Epoch {epoch + 1}/{cfg_train['epochs']} {'='*10}")
         model.train()
         train_loss = 0.0
-        progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")
         
-        for batch in progress_bar:
-            # Di chuyển dữ liệu sang GPU
+        for i, batch in enumerate(tqdm(train_loader, desc="Training")):
             pixel_values = batch["pixel_values"].to(device)
             pixel_mask = batch["pixel_mask"].to(device)
-            # labels là list of dicts, cần chuyển từng tensor trong dict sang device
             labels = [{k: v.to(device) for k, v in t.items()} for t in batch["labels"]]
             
-            optimizer.zero_grad()
-            
-            # Forward Pass
-            outputs = model(
-                pixel_values=pixel_values, 
-                pixel_mask=pixel_mask,
-                labels=labels
-            )
-            
-            # Loss Calculation
-            # outputs.loss là Detection Loss (Hungarian Loss từ YOLOS)
-            # Để đơn giản trong v1.0, ta optimize dựa trên detection loss trước.
-            # (Attribute learning sẽ diễn ra ngầm qua shared backbone + attribute head gradients nếu được thêm vào total loss)
-            loss = outputs.loss
-            
-            # Kiểm tra NaN Loss (tránh crash)
-            if math.isnan(loss.item()):
-                print("Warning: Loss is NaN, skipping batch.")
-                continue
-
-            # Backward Pass
+            outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
+            loss = outputs.loss / cfg_train.get('gradient_accumulation_steps', 1)
             loss.backward()
             
-            # Gradient Clipping (Tránh bùng nổ gradient)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_train['clip_max_norm'])
+            if (i + 1) % cfg_train.get('gradient_accumulation_steps', 1) == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_train['clip_max_norm'])
+                optimizer.step()
+                optimizer.zero_grad()
             
-            optimizer.step()
-            
-            # Logging
-            train_loss += loss.item()
-            progress_bar.set_description(f"Loss: {loss.item():.4f}")
+            train_loss += loss.item() * cfg_train.get('gradient_accumulation_steps', 1)
 
-        avg_train_loss = train_loss / len(train_loader)
-        print(f"Epoch {epoch+1} finished. Avg Train Loss: {avg_train_loss:.4f}")
+        print(f"Avg Train Loss: {train_loss / len(train_loader):.4f}")
 
-        # --- VALIDATION PHASE ---
-        # Chạy Validation mỗi epoch (hoặc có thể chỉnh thành mỗi 5 epoch để tiết kiệm thời gian)
-        print("Running Validation & mAP Calculation...")
+        # VAL
+        print("Running Validation...")
         model.eval()
-        
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Evaluating"):
                 pixel_values = batch["pixel_values"].to(device)
                 pixel_mask = batch["pixel_mask"].to(device)
-                labels = [{k: v.to(device) for k, v in t.items()} for t in batch["labels"]]
-                
-                # 1. Forward
                 outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
                 
-                # 2. Chuẩn bị Target Sizes
                 target_sizes = torch.tensor([img.shape[1:] for img in pixel_values]).to(device)
+                results = processor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.0)
                 
-                results = processor.post_process_object_detection(
-                    outputs, 
-                    target_sizes=target_sizes, 
-                    threshold=0.0 # Lấy tất cả box để tính mAP
-                )
-                # 3. Chuẩn bị Labels (QUAN TRỌNG: Phải tạo mới, không dùng biến cũ nếu nghi ngờ)
-                # Lấy lại raw labels từ batch để chắc chắn nó là List of Dicts
-                raw_labels = batch["labels"]
-                
-                # --- DEBUG CHẶN LỖI (Thêm đoạn này để kiểm tra) ---
-                if not isinstance(raw_labels, list):
-                    print(f"❌ LỖI NGHIÊM TRỌNG: batch['labels'] không phải là List! Nó là: {type(raw_labels)}")
-                    # Thử in nội dung để xem nó là gì
-                    print(raw_labels)
-                    break # Dừng ngay
-                    
-                first_item = raw_labels[0]
-                if not isinstance(first_item, dict):
-                    print(f"❌ LỖI NGHIÊM TRỌNG: Phần tử trong labels không phải Dict! Nó là: {type(first_item)}")
-                    print(f"Nội dung: {first_item}")
-                    break
-                # -----------------------------------------------
+                clean_targets = []
+                for t in batch["labels"]:
+                    clean_t = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in t.items()}
+                    clean_targets.append(clean_t)
+                evaluator.update(results, clean_targets, target_sizes)
 
-                # Chuyển labels sang device thủ công để đảm bảo đúng định dạng
-                clean_labels = []
-                for t in raw_labels:
-                    clean_t = {}
-                    for k, v in t.items():
-                        if isinstance(v, torch.Tensor):
-                            clean_t[k] = v.to(device)
-                        else:
-                            clean_t[k] = v # Giữ nguyên nếu không phải tensor (vd: image_id int)
-                    clean_labels.append(clean_t)
-
-                # 4. Update Evaluator
-                # Lưu ý thứ tự: (outputs, target, target_sizes)
-                evaluator.update(results, clean_labels, target_sizes)
-
-        # Tính toán kết quả
         metrics = evaluator.compute()
-        map_score = metrics['map'].item()
-        map_50 = metrics['map_50'].item()
-        
-        print(f"Validation Results -> mAP: {map_score:.4f} | mAP@50: {map_50:.4f}")
-
-        # --- CHECKPOINT SAVING ---
-        # 1. Lưu Best Model (Dựa trên mAP)
-        if map_score > best_map:
-            best_map = map_score
-            save_path = os.path.join(cfg_train['output_dir'], "best_model")
-            
-            print(f"*** NEW BEST MODEL found (mAP: {best_map:.4f}) -> Saving to {save_path} ***")
-            model.save_pretrained(save_path)
-            processor.save_pretrained(save_path)
-        
-        # 2. Lưu Last Checkpoint (Để resume nếu cần)
-        last_path = os.path.join(cfg_train['output_dir'], "last_checkpoint")
-        model.save_pretrained(last_path)
-        processor.save_pretrained(last_path)
-
-    # End Training
-    total_time = time.time() - start_time
-    print(f"\nTraining completed in {total_time/3600:.2f} hours.")
-    print(f"Best mAP achieved: {best_map:.4f}")
+        if metrics['map'] >= best_map:
+            best_map = metrics['map']
+            print(f"*** Saving Best Model (mAP: {best_map:.4f}) ***")
+            model.save_pretrained(os.path.join(cfg_train['output_dir'], "best_model"))
+            processor.save_pretrained(os.path.join(cfg_train['output_dir'], "best_model"))
 
 if __name__ == "__main__":
     train_model()
