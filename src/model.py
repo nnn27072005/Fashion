@@ -160,6 +160,7 @@ import torch.nn.functional as F
 from transformers import DeformableDetrForObjectDetection, DeformableDetrConfig
 from scipy.optimize import linear_sum_assignment
 from torchvision.ops import generalized_box_iou, box_convert
+import numpy as np
 
 class FashionDeformableDETR(DeformableDetrForObjectDetection):
     def __init__(self, config: DeformableDetrConfig):
@@ -188,8 +189,8 @@ class FashionDeformableDETR(DeformableDetrForObjectDetection):
         self.attr_criterion = nn.BCEWithLogitsLoss()
         
         # Weight cho background class (Deformable DETR thường có 300 queries)
-        empty_weight = torch.ones(self.config.num_labels + 1)
-        empty_weight[-1] = 0.1 
+        empty_weight = torch.ones(self.config.num_labels) 
+        empty_weight[-1] = 0.1 # Giảm trọng số class cuối cùng (Background)
         self.class_criterion = nn.CrossEntropyLoss(weight=empty_weight)
 
     def forward(
