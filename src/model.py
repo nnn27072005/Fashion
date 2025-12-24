@@ -237,98 +237,98 @@ class FashionDeformableDETR(DeformableDetrForObjectDetection):
         
         return outputs
 
-def compute_loss_manual(self, outputs, targets):
-        """
-        Hungarian Matching và tính toán Loss (Đã Fix lỗi NaN/Inf)
-        """
-        device = outputs.logits.device
-        pred_logits = outputs.logits        # [Batch, 300, num_classes+1]
-        pred_boxes = outputs.pred_boxes     # [Batch, 300, 4]
-        pred_attrs = outputs.attr_logits    # [Batch, 300, num_attributes]
-        
-        batch_size = len(targets)
-        
-        loss_ce = 0.0
-        loss_bbox = 0.0
-        loss_giou = 0.0
-        loss_attr = 0.0
-        
-        background_class_idx = self.config.num_labels 
-
-        for i in range(batch_size):
-            tgt_ids = targets[i]["class_labels"]
-            tgt_bbox = targets[i]["boxes"]
-            tgt_attrs = targets[i].get("attribute_labels", None)
+    def compute_loss_manual(self, outputs, targets):
+            """
+            Hungarian Matching và tính toán Loss (Đã Fix lỗi NaN/Inf)
+            """
+            device = outputs.logits.device
+            pred_logits = outputs.logits        # [Batch, 300, num_classes+1]
+            pred_boxes = outputs.pred_boxes     # [Batch, 300, 4]
+            pred_attrs = outputs.attr_logits    # [Batch, 300, num_attributes]
             
-            # Nếu ảnh không có object nào
-            if len(tgt_ids) == 0:
+            batch_size = len(targets)
+            
+            loss_ce = 0.0
+            loss_bbox = 0.0
+            loss_giou = 0.0
+            loss_attr = 0.0
+            
+            background_class_idx = self.config.num_labels 
+
+            for i in range(batch_size):
+                tgt_ids = targets[i]["class_labels"]
+                tgt_bbox = targets[i]["boxes"]
+                tgt_attrs = targets[i].get("attribute_labels", None)
+                
+                # Nếu ảnh không có object nào
+                if len(tgt_ids) == 0:
+                    target_classes = torch.full((pred_logits.shape[1],), background_class_idx, dtype=torch.long, device=device)
+                    loss_ce += self.class_criterion(pred_logits[i], target_classes)
+                    continue
+
+                # --- MATCHING PROCESS (NO GRAD) ---
+                with torch.no_grad():
+                    # 1. Softmax output
+                    out_prob = pred_logits[i].softmax(-1)
+                    
+                    # 2. Xử lý Pred Boxes an toàn (Tránh NaN cho GIoU)
+                    # Kẹp giá trị box vào khoảng (epsilon, 1-epsilon)
+                    pred_boxes_safe = pred_boxes[i].clamp(min=1e-6, max=1.0-1e-6)
+                    
+                    # 3. Tính Cost
+                    cost_class = -out_prob[:, tgt_ids]
+                    cost_bbox = torch.cdist(pred_boxes_safe, tgt_bbox, p=1)
+                    
+                    src_boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes_safe)
+                    tgt_boxes_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
+                    
+                    # GIoU có thể ra NaN nếu box bị lỗi, cần xử lý
+                    giou_val = generalized_box_iou(src_boxes_xyxy, tgt_boxes_xyxy)
+                    # Thay thế nan trong giou bằng -1 (giá trị tồi nhất của GIoU)
+                    giou_val = torch.nan_to_num(giou_val, nan=-1.0)
+                    cost_giou = -giou_val
+
+                    # 4. Tổng hợp Cost Matrix
+                    C = 2.0 * cost_bbox + 2.0 * cost_class + 5.0 * cost_giou
+                    C = C.cpu().numpy()
+                    
+                    # --- FIX CRITICAL ERROR: NaN in Cost Matrix ---
+                    # Kiểm tra và thay thế NaN/Inf bằng giá trị rất lớn để thuật toán không chọn nó
+                    if np.any(np.isnan(C)) or np.any(np.isinf(C)):
+                        # print(f"Warning: Cost matrix contains NaN/Inf at index {i}. Fixing...")
+                        C = np.nan_to_num(C, nan=1e6, posinf=1e6, neginf=1e6)
+                    # ----------------------------------------------
+
+                    src_idx, tgt_idx = linear_sum_assignment(C)
+
+                # --- LOSS CALCULATION ---
+                # 1. Classification Loss
                 target_classes = torch.full((pred_logits.shape[1],), background_class_idx, dtype=torch.long, device=device)
+                target_classes[src_idx] = tgt_ids[tgt_idx]
                 loss_ce += self.class_criterion(pred_logits[i], target_classes)
-                continue
-
-            # --- MATCHING PROCESS (NO GRAD) ---
-            with torch.no_grad():
-                # 1. Softmax output
-                out_prob = pred_logits[i].softmax(-1)
                 
-                # 2. Xử lý Pred Boxes an toàn (Tránh NaN cho GIoU)
-                # Kẹp giá trị box vào khoảng (epsilon, 1-epsilon)
-                pred_boxes_safe = pred_boxes[i].clamp(min=1e-6, max=1.0-1e-6)
+                # 2. Box Loss (Dùng box gốc để tính gradient, không dùng box safe)
+                src_boxes = pred_boxes[i][src_idx]
+                target_boxes = tgt_bbox[tgt_idx]
+                loss_bbox += F.l1_loss(src_boxes, target_boxes, reduction='mean')
                 
-                # 3. Tính Cost
-                cost_class = -out_prob[:, tgt_ids]
-                cost_bbox = torch.cdist(pred_boxes_safe, tgt_bbox, p=1)
+                # 3. GIoU Loss
+                src_boxes_xyxy = box_cxcywh_to_xyxy(src_boxes)
+                tgt_boxes_xyxy = box_cxcywh_to_xyxy(target_boxes)
+                loss_giou += (1 - torch.diag(generalized_box_iou(src_boxes_xyxy, tgt_boxes_xyxy))).mean()
                 
-                src_boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes_safe)
-                tgt_boxes_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
-                
-                # GIoU có thể ra NaN nếu box bị lỗi, cần xử lý
-                giou_val = generalized_box_iou(src_boxes_xyxy, tgt_boxes_xyxy)
-                # Thay thế nan trong giou bằng -1 (giá trị tồi nhất của GIoU)
-                giou_val = torch.nan_to_num(giou_val, nan=-1.0)
-                cost_giou = -giou_val
+                # 4. Attribute Loss
+                if tgt_attrs is not None:
+                    src_attrs = pred_attrs[i][src_idx]
+                    target_attrs = tgt_attrs[tgt_idx]
+                    loss_attr += self.attr_criterion(src_attrs, target_attrs)
 
-                # 4. Tổng hợp Cost Matrix
-                C = 2.0 * cost_bbox + 2.0 * cost_class + 5.0 * cost_giou
-                C = C.cpu().numpy()
-                
-                # --- FIX CRITICAL ERROR: NaN in Cost Matrix ---
-                # Kiểm tra và thay thế NaN/Inf bằng giá trị rất lớn để thuật toán không chọn nó
-                if np.any(np.isnan(C)) or np.any(np.isinf(C)):
-                    # print(f"Warning: Cost matrix contains NaN/Inf at index {i}. Fixing...")
-                    C = np.nan_to_num(C, nan=1e6, posinf=1e6, neginf=1e6)
-                # ----------------------------------------------
-
-                src_idx, tgt_idx = linear_sum_assignment(C)
-
-            # --- LOSS CALCULATION ---
-            # 1. Classification Loss
-            target_classes = torch.full((pred_logits.shape[1],), background_class_idx, dtype=torch.long, device=device)
-            target_classes[src_idx] = tgt_ids[tgt_idx]
-            loss_ce += self.class_criterion(pred_logits[i], target_classes)
-            
-            # 2. Box Loss (Dùng box gốc để tính gradient, không dùng box safe)
-            src_boxes = pred_boxes[i][src_idx]
-            target_boxes = tgt_bbox[tgt_idx]
-            loss_bbox += F.l1_loss(src_boxes, target_boxes, reduction='mean')
-            
-            # 3. GIoU Loss
-            src_boxes_xyxy = box_cxcywh_to_xyxy(src_boxes)
-            tgt_boxes_xyxy = box_cxcywh_to_xyxy(target_boxes)
-            loss_giou += (1 - torch.diag(generalized_box_iou(src_boxes_xyxy, tgt_boxes_xyxy))).mean()
-            
-            # 4. Attribute Loss
-            if tgt_attrs is not None:
-                src_attrs = pred_attrs[i][src_idx]
-                target_attrs = tgt_attrs[tgt_idx]
-                loss_attr += self.attr_criterion(src_attrs, target_attrs)
-
-        return {
-            'loss_ce': loss_ce / batch_size,
-            'loss_bbox': loss_bbox / batch_size,
-            'loss_giou': loss_giou / batch_size,
-            'loss_attr': loss_attr / batch_size
-        }
+            return {
+                'loss_ce': loss_ce / batch_size,
+                'loss_bbox': loss_bbox / batch_size,
+                'loss_giou': loss_giou / batch_size,
+                'loss_attr': loss_attr / batch_size
+            }
 
 def box_cxcywh_to_xyxy(x):
     x_c, y_c, w, h = x.unbind(-1)
