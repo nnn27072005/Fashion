@@ -8,7 +8,7 @@ import albumentations as A
 import random
 import warnings
 warnings.filterwarnings('ignore')
-
+from transformers import DeformableDetrImageProcessor
 
 class ImageAugmentation:
     """
@@ -123,6 +123,167 @@ class ImageAugmentation:
             
         return canvas, boxes
 
+# class FashionDataset(Dataset):
+#     def __init__(self, img_dir, ann_file, feature_extractor, train=False, num_attributes=294):
+#         self.img_dir = img_dir
+#         self.coco = COCO(ann_file)
+#         # self.ids = list(sorted(self.coco.imgs.keys()))
+#         # train with 100 images for quick testing
+#         all_ids = list(sorted(self.coco.imgs.keys()))
+        
+#         if train:
+#             # Lấy 100 ảnh để debug
+#             self.ids = all_ids[:100]  
+#             print(f"⚠️ DEBUG MODE: Đã cắt ngắn Dataset còn {len(self.ids)} ảnh!", flush=True)
+#         else:
+#             # Lấy 50 ảnh để val
+#             self.ids = all_ids[:50]
+#             print(f"ℹ️ VAL MODE: Sử dụng {len(self.ids)} ảnh validation.", flush=True)
+#         self.feature_extractor = feature_extractor
+#         self.num_attributes = num_attributes
+#         self.train = train
+#         self.augmentor = ImageAugmentation(
+#             target_size=(800, 800),
+#             train=train,
+#             p_flip=0.5,
+#             brightness=0.2,
+#             contrast=0.2
+#         )
+
+#     def __getitem__(self, index):
+#         coco = self.coco
+#         img_id = self.ids[index]
+#         ann_ids = coco.getAnnIds(imgIds=img_id)
+#         coco_target = coco.loadAnns(ann_ids)
+
+#         path = coco.loadImgs(img_id)[0]['file_name']
+#         img_path = os.path.join(self.img_dir, path)
+        
+#         image = cv2.imread(img_path)
+#         if image is None:
+#             print(f"Warning: Cannot load image at {img_path}")
+#             return self.__getitem__((index + 1) % len(self))
+            
+#         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+#         # 1. Prepare raw data
+#         boxes = []
+#         category_ids = []
+#         attribute_ids_list = []
+#         area = []
+#         iscrowd = []
+
+#         for ann in coco_target:
+#             x, y, w, h = ann['bbox']
+#             if w <= 0 or h <= 0: continue
+            
+#             # Kẹp box vào trong ảnh
+#             h_img, w_img, _ = image.shape
+#             x = max(0, min(x, w_img - 1))
+#             y = max(0, min(y, h_img - 1))
+#             w = max(1, min(w, w_img - x))
+#             h = max(1, min(h, h_img - y))
+            
+#             boxes.append([x, y, w, h])
+#             category_ids.append(ann['category_id'])
+#             area.append(ann['area'])
+#             iscrowd.append(ann['iscrowd'])
+#             attribute_ids_list.append(ann.get('attribute_ids', []))
+
+#         # 2. Augmentation
+#         image, final_boxes, final_categories = self.augmentor(image, boxes, category_ids)
+#         final_attributes_list = attribute_ids_list # Augment màu/flip không làm thay đổi thuộc tính
+#         final_area = area 
+#         final_iscrowd = iscrowd
+
+#         # 3. Format Output & NORMALIZE (Quan trọng)
+#         # YOLOS/DETR yêu cầu box dạng: [cx, cy, w, h] đã chuẩn hóa về 0-1
+#         out_boxes = []
+#         out_attributes = []
+#         img_h, img_w, _ = image.shape # Kích thước ảnh sau khi augment
+        
+#         for i, box in enumerate(final_boxes):
+#             x, y, w, h = box
+            
+#             # Chuyển đổi: (x, y, w, h) Top-Left Absolute -> (cx, cy, w, h) Center Normalized
+#             cx = (x + w / 2) / img_w
+#             cy = (y + h / 2) / img_h
+#             nw = w / img_w
+#             nh = h / img_h
+            
+#             # Clamp về 0-1 cho chắc chắn
+#             cx = max(0.0, min(1.0, cx))
+#             cy = max(0.0, min(1.0, cy))
+#             nw = max(0.0, min(1.0, nw))
+#             nh = max(0.0, min(1.0, nh))
+            
+#             out_boxes.append([cx, cy, nw, nh])
+            
+#             # Attributes
+#             attr_vec = torch.zeros(self.num_attributes, dtype=torch.float32)
+#             valid_ids = [aid for aid in final_attributes_list[i] if aid < self.num_attributes]
+#             if valid_ids:
+#                 attr_vec[valid_ids] = 1.0
+#             out_attributes.append(attr_vec)
+
+#         target = {}
+#         target["boxes"] = torch.as_tensor(out_boxes, dtype=torch.float32)
+#         target["class_labels"] = torch.as_tensor(final_categories, dtype=torch.long)
+#         target["image_id"] = torch.tensor([img_id])
+        
+#         if len(out_attributes) > 0:
+#             target["attribute_labels"] = torch.stack(out_attributes)
+#             target["area"] = torch.as_tensor(final_area, dtype=torch.float32)
+#             target["iscrowd"] = torch.as_tensor(final_iscrowd, dtype=torch.int64)
+#         else:
+#             target["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
+#             target["class_labels"] = torch.zeros((0,), dtype=torch.long)
+#             target["attribute_labels"] = torch.zeros((0, self.num_attributes), dtype=torch.float32)
+#             target["area"] = torch.zeros((0,), dtype=torch.float32)
+#             target["iscrowd"] = torch.zeros((0,), dtype=torch.int64)
+
+#         # QUAN TRỌNG: Chỉ đưa ảnh vào Processor để chuẩn hóa pixel
+#         encoding = self.feature_extractor(
+#             images=image, 
+#             return_tensors="pt"
+#         )
+        
+#         pixel_values = encoding["pixel_values"].squeeze()
+        
+#         # Trả về pixel_values (đã norm) và target (đã tự tính toán)
+#         return pixel_values, target
+
+#     def __len__(self):
+#         return len(self.ids)
+
+#     def get_weighted_sampler(self):
+#         print("Đang tính toán Class Weights...")
+#         class_counts = {}
+#         img_class_map = {}
+        
+#         for img_id in self.ids:
+#             ann_ids = self.coco.getAnnIds(imgIds=img_id)
+#             anns = self.coco.loadAnns(ann_ids)
+#             classes = [ann['category_id'] for ann in anns]
+#             img_class_map[img_id] = classes
+#             for c in classes:
+#                 class_counts[c] = class_counts.get(c, 0) + 1
+        
+#         total_samples = sum(class_counts.values()) if class_counts else 1
+#         class_weights = {c: total_samples / (cnt + 1e-6) for c, cnt in class_counts.items()}
+        
+#         sample_weights = []
+#         for img_id in self.ids:
+#             classes = img_class_map.get(img_id, [])
+#             if not classes:
+#                 weight = 0.0
+#             else:
+#                 weight = max([class_weights.get(c, 0) for c in classes])
+#             sample_weights.append(weight)
+            
+#         return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+
 class FashionDataset(Dataset):
     def __init__(self, img_dir, ann_file, feature_extractor, train=False, num_attributes=294):
         self.img_dir = img_dir
@@ -139,146 +300,140 @@ class FashionDataset(Dataset):
             # Lấy 50 ảnh để val
             self.ids = all_ids[:50]
             print(f"ℹ️ VAL MODE: Sử dụng {len(self.ids)} ảnh validation.", flush=True)
+             
         self.feature_extractor = feature_extractor
         self.num_attributes = num_attributes
         self.train = train
+        
+        # Dùng Augmentor thủ công (Code ImageAugmentation ở trên giữ nguyên)
         self.augmentor = ImageAugmentation(
-            target_size=(800, 800),
-            train=train,
-            p_flip=0.5,
-            brightness=0.2,
-            contrast=0.2
+            target_size=(800, 800), # Deformable DETR chịu được size lớn tốt hơn
+            train=train
         )
-
+    
+    def __len__(self):
+        return len(self.ids)
+    
     def __getitem__(self, index):
+        # ... (Giữ nguyên phần load ảnh và annotation từ COCO) ...
+        # (Copy y chang đoạn __getitem__ cũ đến trước phần Augmentation)
         coco = self.coco
         img_id = self.ids[index]
         ann_ids = coco.getAnnIds(imgIds=img_id)
         coco_target = coco.loadAnns(ann_ids)
-
         path = coco.loadImgs(img_id)[0]['file_name']
         img_path = os.path.join(self.img_dir, path)
-        
         image = cv2.imread(img_path)
-        if image is None:
-            print(f"Warning: Cannot load image at {img_path}")
-            return self.__getitem__((index + 1) % len(self))
-            
+        if image is None: return self.__getitem__((index + 1) % len(self))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # 1. Prepare raw data
-        boxes = []
-        category_ids = []
-        attribute_ids_list = []
-        area = []
-        iscrowd = []
-
+        boxes, category_ids, attribute_ids_list = [], [], []
+        area, iscrowd = [], []
+        
         for ann in coco_target:
             x, y, w, h = ann['bbox']
             if w <= 0 or h <= 0: continue
-            
-            # Kẹp box vào trong ảnh
-            h_img, w_img, _ = image.shape
-            x = max(0, min(x, w_img - 1))
-            y = max(0, min(y, h_img - 1))
-            w = max(1, min(w, w_img - x))
-            h = max(1, min(h, h_img - y))
-            
             boxes.append([x, y, w, h])
             category_ids.append(ann['category_id'])
             area.append(ann['area'])
             iscrowd.append(ann['iscrowd'])
             attribute_ids_list.append(ann.get('attribute_ids', []))
 
-        # 2. Augmentation
+        # 2. Augmentation (Resize & Flip)
+        # Class ImageAugmentation trả về ảnh numpy và box
         image, final_boxes, final_categories = self.augmentor(image, boxes, category_ids)
-        final_attributes_list = attribute_ids_list # Augment màu/flip không làm thay đổi thuộc tính
+        final_attributes_list = attribute_ids_list 
         final_area = area 
         final_iscrowd = iscrowd
 
-        # 3. Format Output & NORMALIZE (Quan trọng)
-        # YOLOS/DETR yêu cầu box dạng: [cx, cy, w, h] đã chuẩn hóa về 0-1
+        # 3. Format Output & NORMALIZE
         out_boxes = []
         out_attributes = []
-        img_h, img_w, _ = image.shape # Kích thước ảnh sau khi augment
+        img_h, img_w, _ = image.shape 
         
         for i, box in enumerate(final_boxes):
             x, y, w, h = box
-            
-            # Chuyển đổi: (x, y, w, h) Top-Left Absolute -> (cx, cy, w, h) Center Normalized
+            # Normalize (cx, cy, w, h)
             cx = (x + w / 2) / img_w
             cy = (y + h / 2) / img_h
             nw = w / img_w
             nh = h / img_h
-            
-            # Clamp về 0-1 cho chắc chắn
-            cx = max(0.0, min(1.0, cx))
-            cy = max(0.0, min(1.0, cy))
-            nw = max(0.0, min(1.0, nw))
-            nh = max(0.0, min(1.0, nh))
-            
+            cx, cy = max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy))
+            nw, nh = max(0.0, min(1.0, nw)), max(0.0, min(1.0, nh))
             out_boxes.append([cx, cy, nw, nh])
             
             # Attributes
             attr_vec = torch.zeros(self.num_attributes, dtype=torch.float32)
             valid_ids = [aid for aid in final_attributes_list[i] if aid < self.num_attributes]
-            if valid_ids:
-                attr_vec[valid_ids] = 1.0
+            if valid_ids: attr_vec[valid_ids] = 1.0
             out_attributes.append(attr_vec)
 
         target = {}
         target["boxes"] = torch.as_tensor(out_boxes, dtype=torch.float32)
         target["class_labels"] = torch.as_tensor(final_categories, dtype=torch.long)
         target["image_id"] = torch.tensor([img_id])
-        
         if len(out_attributes) > 0:
             target["attribute_labels"] = torch.stack(out_attributes)
             target["area"] = torch.as_tensor(final_area, dtype=torch.float32)
             target["iscrowd"] = torch.as_tensor(final_iscrowd, dtype=torch.int64)
         else:
+            # Handle empty
             target["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
             target["class_labels"] = torch.zeros((0,), dtype=torch.long)
             target["attribute_labels"] = torch.zeros((0, self.num_attributes), dtype=torch.float32)
             target["area"] = torch.zeros((0,), dtype=torch.float32)
             target["iscrowd"] = torch.zeros((0,), dtype=torch.int64)
 
-        # QUAN TRỌNG: Chỉ đưa ảnh vào Processor để chuẩn hóa pixel
+        # 4. PROCESSOR (Khác YOLOS ở đây)
+        # Deformable DETR cần pixel_mask. Ta để Processor tự lo việc Normalize Pixel
+        # Lưu ý: ImageAugmentation đã resize rồi, processor chỉ convert tensor và normalize màu
         encoding = self.feature_extractor(
             images=image, 
             return_tensors="pt"
         )
         
-        pixel_values = encoding["pixel_values"].squeeze()
-        
-        # Trả về pixel_values (đã norm) và target (đã tự tính toán)
-        return pixel_values, target
-
-    def __len__(self):
-        return len(self.ids)
-
+        # encoding chứa: 'pixel_values' và 'pixel_mask'
+        return {
+            "pixel_values": encoding["pixel_values"].squeeze(),
+            "pixel_mask": encoding.get("pixel_mask", None), # Có thể None nếu batch=1 chưa pad
+            "target": target
+        }
+    
     def get_weighted_sampler(self):
-        print("Đang tính toán Class Weights...")
+        """
+        Tính toán trọng số để bốc mẫu sao cho các class hiếm xuất hiện nhiều hơn.
+        Cực kỳ quan trọng cho Fashionpedia.
+        """
+        print("⚖️ Đang tính toán Class Weights cho Deformable DETR...")
         class_counts = {}
         img_class_map = {}
         
+        # Duyệt qua toàn bộ dataset (chỉ lấy ID trong self.ids)
         for img_id in self.ids:
             ann_ids = self.coco.getAnnIds(imgIds=img_id)
             anns = self.coco.loadAnns(ann_ids)
+            # Lấy danh sách category_id trong ảnh đó
             classes = [ann['category_id'] for ann in anns]
             img_class_map[img_id] = classes
+            
             for c in classes:
                 class_counts[c] = class_counts.get(c, 0) + 1
         
+        # Tính weight cho từng class (nghịch đảo tần suất)
+        # Class càng ít xuất hiện -> Weight càng cao
         total_samples = sum(class_counts.values()) if class_counts else 1
         class_weights = {c: total_samples / (cnt + 1e-6) for c, cnt in class_counts.items()}
         
+        # Gán weight cho từng bức ảnh
+        # Weight của ảnh = Weight lớn nhất của class có trong ảnh đó (ưu tiên ảnh có class hiếm)
         sample_weights = []
         for img_id in self.ids:
             classes = img_class_map.get(img_id, [])
             if not classes:
-                weight = 0.0
+                weight = 0.0 # Ảnh không có object nào (background only) -> Ít ưu tiên
             else:
                 weight = max([class_weights.get(c, 0) for c in classes])
             sample_weights.append(weight)
             
+        # Trả về Sampler
         return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)

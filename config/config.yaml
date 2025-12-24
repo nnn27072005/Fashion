@@ -1,15 +1,12 @@
 system:
   device: "cuda"          # Sử dụng "cpu" nếu không có GPU
-  num_workers: 2          # Số luồng load dữ liệu (Tăng lên 4 nếu CPU mạnh)
+  num_workers: 4          # Số luồng load dữ liệu (Tăng lên 4 nếu CPU mạnh)
   seed: 42
 
 model:
-  base_model: "hustvl/yolos-small"
-  # Fashionpedia có 46 loại vật thể (Categories)
-  num_classes: 46       
-  # Fashionpedia có 294 loại thuộc tính (Attributes: Color, Material, Pattern...)
-  num_attributes: 294   
-  confidence_threshold: 0.5
+  base_model: "SenseTime/deformable-detr" # Model gốc thay vì YOLOS
+  num_classes: 46 # Fashionpedia gốc (hoặc 47 nếu bạn custom)
+  num_attributes: 294
 
 training:
   # Đường dẫn tới thư mục chứa ảnh
@@ -25,8 +22,8 @@ training:
   output_dir: "./checkpoints"
   
   # Hyperparameters
-  batch_size: 4         # RTX 3060 12GB có thể thử tăng lên 8
-  epochs: 50            # Train đủ lâu để model học được attribute
+  batch_size: 8        # RTX 3060 12GB có thể thử tăng lên 8
+  epochs: 30           # Train đủ lâu để model học được attribute
   lr: 2.0e-5            # Learning rate (0.00002) - Thấp để fine-tune backbone
   weight_decay: 1.0e-4  # 0.0001
   clip_max_norm: 0.1    # Chống bùng nổ gradient
@@ -90,3 +87,4 @@ classes:
   43: "ruffle"
   44: "sequin"
   45: "tassel"
+  # có thể thêm các classes khác nếu cần thiết

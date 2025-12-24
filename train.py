@@ -3,13 +3,15 @@ import yaml
 import torch
 import math
 from torch.utils.data import DataLoader
-from transformers import YolosImageProcessor, YolosConfig
+# from transformers import YolosImageProcessor, YolosConfig
+from transformers import DeformableDetrImageProcessor, DeformableDetrConfig
 from tqdm import tqdm
 import time
 
 # Import các module local đã xây dựng
 from src.dataset import FashionDataset
-from src.model import FashionYolos
+# from src.model import FashionYolos
+from src.model import FashionDeformableDETR
 from src.utils import collate_fn
 from src.eval import Evaluator
 
@@ -42,18 +44,29 @@ def train_model():
     
     # Processor (Dùng để resize/normalize ảnh)
     # size={"shortest_edge": 512, "longest_edge": 800} là setting chuẩn cho YOLOS Small
-    processor = YolosImageProcessor.from_pretrained(
+    # processor = YolosImageProcessor.from_pretrained(
+    #     cfg_model['base_model'],
+    #     size={"shortest_edge": 512, "longest_edge": 800} 
+    # )
+    processor = DeformableDetrImageProcessor.from_pretrained(
         cfg_model['base_model'],
-        size={"shortest_edge": 512, "longest_edge": 800} 
+        size={"shortest_edge": 800, "longest_edge": 1333} # Config chuẩn của Deformable DETR
     )
     
     # Config Model
-    config = YolosConfig.from_pretrained(cfg_model['base_model'])
+    # config = YolosConfig.from_pretrained(cfg_model['base_model'])
+    # config.num_labels = cfg_model['num_classes']
+    # config.num_attributes = cfg_model['num_attributes']
+    config = DeformableDetrConfig.from_pretrained(cfg_model['base_model'])
     config.num_labels = cfg_model['num_classes']
     config.num_attributes = cfg_model['num_attributes']
-    
     # Khởi tạo Custom Model (FashionYolos)
-    model = FashionYolos.from_pretrained(
+    # model = FashionYolos.from_pretrained(
+    #     cfg_model['base_model'], 
+    #     config=config,
+    #     ignore_mismatched_sizes=True
+    # )
+    model = FashionDeformableDETR.from_pretrained(
         cfg_model['base_model'], 
         config=config,
         ignore_mismatched_sizes=True
@@ -140,7 +153,6 @@ def train_model():
     # ---------------------------------------------------------
     for epoch in range(cfg_train['epochs']):
         print(f"\n{'='*20} Epoch {epoch + 1}/{cfg_train['epochs']} {'='*20}")
-        
         # --- TRAINING PHASE ---
         model.train()
         train_loss = 0.0
@@ -149,13 +161,18 @@ def train_model():
         for batch in progress_bar:
             # Di chuyển dữ liệu sang GPU
             pixel_values = batch["pixel_values"].to(device)
+            pixel_mask = batch["pixel_mask"].to(device)
             # labels là list of dicts, cần chuyển từng tensor trong dict sang device
             labels = [{k: v.to(device) for k, v in t.items()} for t in batch["labels"]]
             
             optimizer.zero_grad()
             
             # Forward Pass
-            outputs = model(pixel_values=pixel_values, labels=labels)
+            outputs = model(
+                pixel_values=pixel_values, 
+                pixel_mask=pixel_mask,
+                labels=labels
+            )
             
             # Loss Calculation
             # outputs.loss là Detection Loss (Hungarian Loss từ YOLOS)
@@ -189,16 +206,22 @@ def train_model():
         model.eval()
         
         with torch.no_grad():
-            for (i,batch) in tqdm(enumerate(val_loader), desc="Evaluating"):
+            for batch in tqdm(val_loader, desc="Evaluating"):
                 pixel_values = batch["pixel_values"].to(device)
+                pixel_mask = batch["pixel_mask"].to(device)
                 labels = [{k: v.to(device) for k, v in t.items()} for t in batch["labels"]]
                 
                 # 1. Forward
-                outputs = model(pixel_values=pixel_values)
+                outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
                 
                 # 2. Chuẩn bị Target Sizes
                 target_sizes = torch.tensor([img.shape[1:] for img in pixel_values]).to(device)
                 
+                results = processor.post_process_object_detection(
+                    outputs, 
+                    target_sizes=target_sizes, 
+                    threshold=0.0 # Lấy tất cả box để tính mAP
+                )
                 # 3. Chuẩn bị Labels (QUAN TRỌNG: Phải tạo mới, không dùng biến cũ nếu nghi ngờ)
                 # Lấy lại raw labels từ batch để chắc chắn nó là List of Dicts
                 raw_labels = batch["labels"]
@@ -230,7 +253,7 @@ def train_model():
 
                 # 4. Update Evaluator
                 # Lưu ý thứ tự: (outputs, target, target_sizes)
-                evaluator.update(outputs, clean_labels, target_sizes)
+                evaluator.update(results, clean_labels, target_sizes)
 
         # Tính toán kết quả
         metrics = evaluator.compute()
